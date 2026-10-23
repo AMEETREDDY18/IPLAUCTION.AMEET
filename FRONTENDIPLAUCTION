@@ -1,0 +1,184 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const admin = require('firebase-admin');
+
+// Initialize Firebase Admin
+// Make sure serviceAccountKey.json is in the server folder
+let serviceAccount;
+try {
+  serviceAccount = require('./serviceAccountKey.json');
+} catch (error) {
+  console.error("Error: serviceAccountKey.json not found. Please download it from Firebase Console.");
+  process.exit(1);
+}
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*", methods: ["GET", "POST"] }
+});
+
+app.use(cors());
+app.use(express.json());
+
+// In-memory store for active auctions
+// In production, use Redis or Firebase Firestore for persistence
+let auctions = {};
+
+// Helper to verify Firebase ID Token
+const verifyToken = async (token) => {
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    return decoded;
+  } catch (error) {
+    throw new Error("Invalid Token");
+  }
+};
+
+// --- SOCKET.IO LOGIC ---
+io.on('connection', (socket) => {
+  console.log(`User Connected: ${socket.id}`);
+
+  // User joins an auction room
+  socket.on('join-auction', async ({ auctionId, userId, teamName, token }) => {
+    try {
+      const user = await verifyToken(token);
+      socket.join(auctionId);
+
+      // Initialize auction if it doesn't exist
+      if (!auctions[auctionId]) {
+        auctions[auctionId] = {
+          id: auctionId,
+          teams: {},
+          current: null,
+          state: 'idle',
+          players: [] // List of available players
+        };
+      }
+
+      // Add team if not already present
+      if (!auctions[auctionId].teams[teamName]) {
+        auctions[auctionId].teams[teamName] = {
+          userId: user.uid,
+          name: teamName,
+          budget: 100, // Default 100 Crore
+          squad: [],
+          slots: 25
+        };
+      }
+
+      // Send current state to the joining user
+      socket.emit('auction-state-update', auctions[auctionId]);
+
+      // Notify others in the room
+      socket.to(auctionId).emit('team-joined', {
+        teamName,
+        budget: auctions[auctionId].teams[teamName].budget
+      });
+
+    } catch (error) {
+      socket.emit('error', 'Authentication failed');
+    }
+  });
+
+  // Start a player auction
+  socket.on('start-player', async ({ auctionId, playerData, token }) => {
+    const user = await verifyToken(token);
+    const auction = auctions[auctionId];
+    if (!auction) return;
+
+    // Only auctioneer (owner) can start, for now we allow anyone with token
+    auction.current = {
+      ...playerData,
+      currentBid: playerData.basePrice,
+      highestBidder: null,
+      timeLeft: 30
+    };
+    auction.state = 'bidding';
+
+    io.to(auctionId).emit('player-on-auction', auction.current);
+
+    // Start Timer
+    const timer = setInterval(() => {
+      if (!auction.current) {
+        clearInterval(timer);
+        return;
+      }
+      auction.current.timeLeft--;
+      io.to(auctionId).emit('timer-update', auction.current.timeLeft);
+
+      if (auction.current.timeLeft <= 0) {
+        clearInterval(timer);
+        finalizeAuction(auctionId);
+      }
+    }, 1000);
+  });
+
+  // Place a bid
+  socket.on('place-bid', async ({ auctionId, teamName, amount, token }) => {
+    const user = await verifyToken(token);
+    const auction = auctions[auctionId];
+    if (!auction || !auction.current) return;
+
+    const team = auction.teams[teamName];
+    if (!team) return;
+
+    if (amount > team.budget) {
+      io.to(auctionId).emit('error', `${teamName} has insufficient budget!`);
+      return;
+    }
+
+    // Update State
+    auction.current.currentBid = amount;
+    auction.current.highestBidder = teamName;
+    auction.current.timeLeft = 15; // Reset to 15s on new bid
+
+    io.to(auctionId).emit('new-bid', {
+      player: auction.current.name,
+      bid: amount,
+      bidder: teamName,
+      timeLeft: 15
+    });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected');
+  });
+});
+
+// Finalize Auction (Sold or Unsold)
+function finalizeAuction(auctionId) {
+  const auction = auctions[auctionId];
+  if (!auction || !auction.current) return;
+
+  const winner = auction.current.highestBidder;
+
+  if (winner) {
+    auction.teams[winner].budget -= auction.current.currentBid;
+    auction.teams[winner].squad.push(auction.current);
+    io.to(auctionId).emit('player-sold', {
+      player: auction.current,
+      team: winner,
+      price: auction.current.currentBid,
+      remainingBudget: auction.teams[winner].budget
+    });
+  } else {
+    io.to(auctionId).emit('player-unsold', { player: auction.current });
+  }
+
+  // Clear current player
+  auction.current = null;
+  auction.state = 'idle';
+  io.to(auctionId).emit('auction-idle');
+}
+
+server.listen(5000, () => {
+  console.log('IPL Auction Server running on port 5000');
+});
